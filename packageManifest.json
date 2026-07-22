@@ -1,0 +1,27 @@
+{
+  "packageName": "MySubaru",
+  "author": "jlslate",
+  "minimumHEVersion": "2.3.4",
+  "version": "1.0.0",
+  "dateReleased": "2026-07-21",
+  "releaseNotes": "Initial release: lock/unlock, horn/lights, remote start/stop, locate, EV charge-now, and status attributes for Subaru STARLINK-connected vehicles.",
+  "documentationLink": "https://github.com/jlslate/Hubitat-MySubaru",
+  "apps": [
+    {
+      "id": "E1ED8A41-1633-40DA-9699-8D9B3D9ED2B2",
+      "name": "Subaru Connect",
+      "namespace": "jlslate",
+      "location": "https://raw.githubusercontent.com/jlslate/Hubitat-MySubaru/main/Hubitat-MySubaru-App.groovy",
+      "required": true
+    }
+  ],
+  "drivers": [
+    {
+      "id": "02258AE5-DF0F-406E-A1C5-F500A88B50FF",
+      "name": "Subaru Vehicle",
+      "namespace": "jlslate",
+      "location": "https://raw.githubusercontent.com/jlslate/Hubitat-MySubaru/main/Hubitat-MySubaru-Driver.groovy",
+      "required": true
+    }
+  ]
+}
