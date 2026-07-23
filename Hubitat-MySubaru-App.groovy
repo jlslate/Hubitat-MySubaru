@@ -208,6 +208,7 @@ def installed() {
 def updated() {
     log.info "Subaru Connect updated"
     unschedule()
+    unsubscribe()
     if (state.savedPin != null && settings.subaruPin != state.savedPin) state.pinLockout = false
     state.savedPin = settings.subaruPin
     initialize()
@@ -220,15 +221,22 @@ def uninstalled() {
 def initialize() {
     if (state.vehicles) {
         createChildDevices()
+        // Re-arm the poll loop after a hub reboot, since a runIn chain doesn't survive one.
+        subscribe(location, "systemStart", "scheduledPoll")
         runIn(5, "scheduledPoll")
     }
 }
 
 def scheduledPoll() {
-    getChildDevices()?.each { cd -> componentRefresh(cd) }
-    Integer mins = (settings.pollIntervalMinutes ?: 30) as Integer
-    if (mins < 5) mins = 5
+    // Schedule the next run first so one bad cycle (a flaky vendor API, a thrown exception)
+    // can't silently kill the polling loop - only the reschedule call below guarantees that.
+    Integer mins = Math.max(5, (settings.pollIntervalMinutes ?: 30) as Integer)
     runIn(mins * 60, "scheduledPoll")
+    try {
+        getChildDevices()?.each { cd -> componentRefresh(cd) }
+    } catch (Exception e) {
+        logWarn "scheduledPoll: ${e.message}"
+    }
 }
 
 private void createChildDevices() {
@@ -273,44 +281,36 @@ def componentRefresh(childDevice) {
 
 def componentLock(childDevice) {
     String vin = childDevice.getDataValue("vin")
-    Map result = executeRemoteCommand(vin, API_LOCK, [forceKeyInCar: false])
-    if (result?.success) childDevice.sendEvent(name: "lock", value: "locked")
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_LOCK, [forceKeyInCar: false], null, "LOCK")
 }
 
 def componentUnlock(childDevice, String door = DOOR_ALL) {
     String vin = childDevice.getDataValue("vin")
-    Map result = executeRemoteCommand(vin, API_UNLOCK, [unlockDoorType: door])
-    if (result?.success) childDevice.sendEvent(name: "lock", value: "unlocked")
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_UNLOCK, [unlockDoorType: door], null, "UNLOCK")
 }
 
 def componentHornAndLights(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String poll = effectiveApiGen(vin) == "g1" ? API_G1_HORN_LIGHTS_STATUS : API_REMOTE_SVC_STATUS
-    Map result = executeRemoteCommand(vin, API_HORN_LIGHTS, [:], poll)
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_HORN_LIGHTS, [:], poll)
 }
 
 def componentStopHornAndLights(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String poll = effectiveApiGen(vin) == "g1" ? API_G1_HORN_LIGHTS_STATUS : API_REMOTE_SVC_STATUS
-    Map result = executeRemoteCommand(vin, API_HORN_LIGHTS_STOP, [:], poll)
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_HORN_LIGHTS_STOP, [:], poll)
 }
 
 def componentFlashLights(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String poll = effectiveApiGen(vin) == "g1" ? API_G1_HORN_LIGHTS_STATUS : API_REMOTE_SVC_STATUS
-    Map result = executeRemoteCommand(vin, API_LIGHTS, [:], poll)
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_LIGHTS, [:], poll)
 }
 
 def componentStopFlashLights(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String poll = effectiveApiGen(vin) == "g1" ? API_G1_HORN_LIGHTS_STATUS : API_REMOTE_SVC_STATUS
-    Map result = executeRemoteCommand(vin, API_LIGHTS_STOP, [:], poll)
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_LIGHTS_STOP, [:], poll)
 }
 
 def componentLocate(childDevice) {
@@ -318,9 +318,7 @@ def componentLocate(childDevice) {
     String gen = effectiveApiGen(vin)
     String url = gen == "g1" ? API_G1_LOCATE_UPDATE : API_G2_LOCATE_UPDATE
     String poll = gen == "g1" ? API_G1_LOCATE_STATUS : API_G2_LOCATE_STATUS
-    Map result = executeRemoteCommand(vin, url, [:], poll)
-    if (result?.success && result?.result) updateLocationAttributes(childDevice, result.result as Map)
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, url, [:], poll, "LOCATE")
 }
 
 def componentRemoteStop(childDevice) {
@@ -329,8 +327,7 @@ def componentRemoteStop(childDevice) {
         logWarn "Remote stop not supported on ${vin}"
         return
     }
-    Map result = executeRemoteCommand(vin, API_G2_REMOTE_ENGINE_STOP)
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_G2_REMOTE_ENGINE_STOP)
 }
 
 def componentRemoteStart(childDevice, String presetName) {
@@ -346,14 +343,15 @@ def componentRemoteStart(childDevice, String presetName) {
         childDevice.sendEvent(name: "lastCommandResult", value: "failed: unknown preset")
         return
     }
+    // Staging the preset is a single quick call, not the multi-attempt poll loop below, so it
+    // stays synchronous.
     Map saveResp = subaruPostJson(API_G2_SAVE_RES_QUICK_START_SETTINGS, preset)
     if (!saveResp?.success) {
         logWarn "Failed to stage climate preset '${presetName}': ${saveResp?.errorCode}"
         childDevice.sendEvent(name: "lastCommandResult", value: "failed: ${saveResp?.errorCode}")
         return
     }
-    Map result = executeRemoteCommand(vin, API_G2_REMOTE_ENGINE_START, preset)
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_G2_REMOTE_ENGINE_START, preset)
 }
 
 def componentChargeStart(childDevice) {
@@ -362,8 +360,7 @@ def componentChargeStart(childDevice) {
         logWarn "Charge start not supported on ${vin}"
         return
     }
-    Map result = executeRemoteCommand(vin, API_EV_CHARGE_NOW)
-    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    executeRemoteCommand(childDevice, vin, API_EV_CHARGE_NOW)
 }
 
 /* ---------------- Attribute parsing ---------------- */
@@ -453,8 +450,11 @@ private void fetchPresets(childDevice, String vin) {
             logDebug "Failed to parse user climate presets: ${e.message}"
         }
     }
-    state.vehiclePresets = state.vehiclePresets ?: [:]
-    state.vehiclePresets[vin] = presets
+    // Reassign the whole top-level key rather than mutating the nested map in place -
+    // Hubitat's state persistence doesn't reliably detect in-place mutation of nested collections.
+    Map presetsByVin = (state.vehiclePresets ?: [:]) as Map
+    presetsByVin[vin] = presets
+    state.vehiclePresets = presetsByVin
     childDevice.sendEvent(name: "presets", value: presets.collect { it.name }.join(", "))
 }
 
@@ -595,56 +595,96 @@ private boolean ensureSession(String vin) {
     return selectVehicle(vin)
 }
 
-/* ---------------- Remote command execution + polling ---------------- */
+/* ---------------- Remote command execution + polling ----------------
+ * Fully async: fire the command, then poll for completion via runInMillis
+ * continuations instead of blocking a platform thread with pauseExecution.
+ * A single command can take up to ~45s round trip (Subaru's own server-side
+ * timing), which is too long to hold a synchronous Hubitat worker thread for.
+ *
+ * "kind" tags the command so finishCommand() knows what device-state side
+ * effect (if any) to apply once it completes: LOCK/UNLOCK set the lock
+ * attribute, LOCATE updates lat/long, anything else just records
+ * lastCommandResult.
+ */
 
-private Map executeRemoteCommand(String vin, String path, Map extraBody = [:], String pollPath = null) {
-    if (state.pinLockout) return [success: false, errorCode: "PIN_LOCKOUT"]
-    if (!ensureSession(vin)) return [success: false, errorCode: "SESSION_FAILED"]
+private void executeRemoteCommand(childDevice, String vin, String path, Map extraBody = [:], String pollPath = null, String kind = "GENERIC") {
+    Map ctx = [dni: childDevice.deviceNetworkId, vin: vin, kind: kind]
+    if (state.pinLockout) { finishCommand(ctx, [success: false, errorCode: "PIN_LOCKOUT"]); return }
+    if (!ensureSession(vin)) { finishCommand(ctx, [success: false, errorCode: "SESSION_FAILED"]); return }
     String gen = effectiveApiGen(vin)
     String resolvedPath = path.replace("api_gen", gen)
-    String resolvedPoll = (pollPath ?: API_REMOTE_SVC_STATUS).replace("api_gen", gen)
+    ctx.pollPath = (pollPath ?: API_REMOTE_SVC_STATUS).replace("api_gen", gen)
     Map body = [pin: settings.subaruPin, delay: 0, vin: vin] + extraBody
-    Map resp = subaruPostJson(resolvedPath, body)
-    if (resp?.errorCode in ["InvalidCredentials", "SXM40006"]) {
-        state.pinLockout = true
-        logWarn "Subaru rejected the remote services PIN - commands disabled until it's corrected in app settings"
-        return [success: false, errorCode: "INVALID_PIN"]
-    }
-    if (resp?.errorCode == "ServiceAlreadyStarted" || resp?.errorCode == "SXM40009") {
-        // A prior command is still in flight server-side; treat as non-fatal, nothing more to do here.
-        return [success: false, errorCode: resp.errorCode]
-    }
-    if (!resp?.success) {
-        logWarn "Command ${resolvedPath} failed: ${resp?.errorCode}"
-        return [success: false, errorCode: resp?.errorCode ?: "REQUEST_FAILED"]
-    }
-    String reqId = resp.data?.serviceRequestId
-    if (!reqId) return [success: false, errorCode: "NO_REQUEST_ID"]
-    return pollServiceRequest(vin, reqId, resolvedPoll)
+    Map params = [uri: apiBase() + resolvedPath, headers: httpHeaders(), body: body, requestContentType: "application/json", timeout: 25]
+    asynchttpPost("onCommandPosted", params, ctx)
 }
 
-private Map pollServiceRequest(String vin, String reqId, String pollPath) {
-    // Real vehicle commands take 5-20s round trip; give it up to 45s total before giving up.
-    long deadline = now() + 45000
-    double intervalSec = 2.0
-    while (now() < deadline) {
-        Map resp = subaruGet(pollPath, [serviceRequestId: reqId])
-        if (resp?.errorCode) {
-            if (resp.errorCode in ["403-soa-unableToParseResponseBody", "InvalidToken"]) {
-                state.cookies = null
-                state.cookieJar = [:]
-                ensureSession(vin)
-                pauseExecution(1000)
-                continue
-            }
-            return [success: false, errorCode: resp.errorCode]
-        }
-        Map data = resp?.data as Map
-        if (data?.remoteServiceState == "finished") return data
-        pauseExecution((intervalSec * 1000) as int)
-        intervalSec = Math.min(intervalSec * 1.5, 15.0)
+def onCommandPosted(resp, Map ctx) {
+    Map result = parseAsyncJson(resp)
+    if (result == null) { finishCommand(ctx, [success: false, errorCode: "HTTP_${resp?.status ?: 'ERROR'}"]); return }
+    if (result.errorCode in ["InvalidCredentials", "SXM40006"]) {
+        state.pinLockout = true
+        logWarn "Subaru rejected the remote services PIN - commands disabled until it's corrected in app settings"
+        finishCommand(ctx, [success: false, errorCode: "INVALID_PIN"])
+        return
     }
-    return [success: false, errorCode: "TIMEOUT"]
+    if (result.errorCode in ["ServiceAlreadyStarted", "SXM40009"]) {
+        // A prior command is still in flight server-side; treat as non-fatal, nothing more to do here.
+        finishCommand(ctx, [success: false, errorCode: result.errorCode])
+        return
+    }
+    if (!result.success) {
+        logWarn "Command ${ctx.pollPath} failed: ${result.errorCode}"
+        finishCommand(ctx, [success: false, errorCode: result.errorCode ?: "REQUEST_FAILED"])
+        return
+    }
+    String reqId = result.data?.serviceRequestId
+    if (!reqId) { finishCommand(ctx, [success: false, errorCode: "NO_REQUEST_ID"]); return }
+    Map pollCtx = ctx + [reqId: reqId, deadline: now() + 45000, intervalMs: 2000]
+    runInMillis(pollCtx.intervalMs as Long, "pollCommand", [data: pollCtx, overwrite: false])
+}
+
+def pollCommand(Map ctx) {
+    if (now() > (ctx.deadline as Long)) { finishCommand(ctx, [success: false, errorCode: "TIMEOUT"]); return }
+    Map params = [uri: apiBase() + (ctx.pollPath as String), headers: httpHeaders(), query: [serviceRequestId: ctx.reqId], timeout: 25]
+    asynchttpGet("onPollResult", params, ctx)
+}
+
+def onPollResult(resp, Map ctx) {
+    Map result = parseAsyncJson(resp)
+    if (result == null) { finishCommand(ctx, [success: false, errorCode: "HTTP_${resp?.status ?: 'ERROR'}"]); return }
+    if (result.errorCode) {
+        if (result.errorCode in ["403-soa-unableToParseResponseBody", "InvalidToken"]) {
+            state.cookies = null
+            state.cookieJar = [:]
+            ensureSession(ctx.vin as String)
+            runInMillis(1000, "pollCommand", [data: ctx + [intervalMs: 1000], overwrite: false])
+            return
+        }
+        finishCommand(ctx, [success: false, errorCode: result.errorCode])
+        return
+    }
+    Map data = result.data as Map
+    if (data?.remoteServiceState == "finished") { finishCommand(ctx, data); return }
+    Integer nextInterval = Math.min(((ctx.intervalMs as Integer) * 1.5) as int, 15000)
+    runInMillis(nextInterval as Long, "pollCommand", [data: ctx + [intervalMs: nextInterval], overwrite: false])
+}
+
+private void finishCommand(Map ctx, Map result) {
+    def childDevice = getChildDevice(ctx.dni as String)
+    if (!childDevice) return
+    childDevice.sendEvent(name: "lastCommandResult", value: result?.success ? "success" : "failed: ${result?.errorCode}")
+    switch (ctx.kind) {
+        case "LOCK":
+            if (result?.success) childDevice.sendEvent(name: "lock", value: "locked")
+            break
+        case "UNLOCK":
+            if (result?.success) childDevice.sendEvent(name: "lock", value: "unlocked")
+            break
+        case "LOCATE":
+            if (result?.success && result?.result) updateLocationAttributes(childDevice, result.result as Map)
+            break
+    }
 }
 
 /* ---------------- HTTP plumbing ---------------- */
@@ -710,6 +750,55 @@ private void captureCookies(resp) {
         logDebug "Cookie jar now: ${state.cookies}"
     } catch (Exception e) {
         logDebug "captureCookies error: ${e.message}"
+    }
+}
+
+// Async counterpart of captureCookies(). Hubitat's AsyncResponse may expose headers as either
+// a Map (single value per name) or an iterable of {name, value} pairs depending on platform
+// version - handled defensively here since it can't be verified without a live hub.
+private void captureCookiesFromAsync(resp) {
+    try {
+        def headers = resp?.headers
+        if (!headers) return
+        List rawCookies = []
+        if (headers instanceof Map) {
+            headers.each { k, v -> if (k?.toString()?.equalsIgnoreCase("Set-Cookie")) rawCookies << v?.toString() }
+        } else {
+            headers.each { h ->
+                try {
+                    if (h?.name?.toString()?.equalsIgnoreCase("Set-Cookie")) rawCookies << h.value?.toString()
+                } catch (ignored) { }
+            }
+        }
+        if (!rawCookies) return
+        Map jar = state.cookieJar ? new LinkedHashMap(state.cookieJar as Map) : [:]
+        rawCookies.each { raw ->
+            String pair = raw?.split(";")?.getAt(0)
+            int idx = pair ? pair.indexOf("=") : -1
+            if (idx > 0) jar[pair.substring(0, idx)] = pair.substring(idx + 1)
+        }
+        state.cookieJar = jar
+        state.cookies = jar.collect { k, v -> "${k}=${v}" }.join("; ")
+    } catch (Exception e) {
+        logDebug "captureCookiesFromAsync error: ${e.message}"
+    }
+}
+
+// Note: unlike the sync helpers, this doesn't auto-retry on a 404 API-version bump - the next
+// command still goes through ensureSession()'s synchronous validateSession call first, which
+// already carries that retry logic, so the version self-corrects before the async path is hit again.
+private Map parseAsyncJson(resp) {
+    try {
+        if (resp == null || resp.hasError() || (resp.status ?: 0) != 200) {
+            logWarn "Async request failed: status=${resp?.status} error=${resp?.errorMessage}"
+            return null
+        }
+        captureCookiesFromAsync(resp)
+        def json = resp.getJson()
+        return (json instanceof Map) ? json as Map : null
+    } catch (Exception e) {
+        logWarn "Failed to parse async response: ${e.message}"
+        return null
     }
 }
 

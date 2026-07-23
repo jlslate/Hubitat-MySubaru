@@ -2,9 +2,9 @@
   "packageName": "MySubaru",
   "author": "jlslate",
   "minimumHEVersion": "2.3.4",
-  "version": "1.0.0",
-  "dateReleased": "2026-07-21",
-  "releaseNotes": "Initial release: lock/unlock, horn/lights, remote start/stop, locate, EV charge-now, and status attributes for Subaru STARLINK-connected vehicles.",
+  "version": "1.1.0",
+  "dateReleased": "2026-07-22",
+  "releaseNotes": "Reliability hardening from community code review: command execution/polling converted from blocking pauseExecution loops to async HTTP + scheduled continuations (no longer ties up a platform thread for up to 45s per command), scheduledPoll now re-arms itself before doing work so one bad refresh can't silently kill the polling loop, polling resumes automatically after a hub reboot, and climate preset caching now persists reliably across app reloads.",
   "documentationLink": "https://github.com/jlslate/Hubitat-MySubaru",
   "apps": [
     {
