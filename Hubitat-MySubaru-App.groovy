@@ -66,7 +66,7 @@ import groovy.json.JsonSlurper
 
 // Kept in sync with packageManifest.json's version - shown in the UI and logs to make it
 // easy to tell which release someone's running when troubleshooting.
-@Field static final String CODE_VERSION = "1.2.0"
+@Field static final String CODE_VERSION = "1.3.0"
 
 definition(
     name: "Subaru Connect",
@@ -275,6 +275,10 @@ private void createChildDevices() {
                 name : "Subaru ${info.modelYear ?: ''} ${info.modelName ?: ''}".trim(),
                 label: info.nickname ?: "Subaru ${info.modelName ?: vin}"
             ])
+            // New device: seed lock as "unknown" so the Lock capability has a defined initial
+            // state. It becomes locked/unlocked only after a command - Subaru never reports lock
+            // status via polls (see updateConditionAttributes).
+            cd.sendEvent(name: "lock", value: "unknown")
         }
         cd.updateDataValue("vin", vin)
         cd.sendEvent(name: "modelName", value: info.modelName)
@@ -393,25 +397,46 @@ void componentChargeStart(childDevice) {
 /* ---------------- Attribute parsing ---------------- */
 
 private void updateStatusAttributes(childDevice, String vin, Map data) {
-    if (data.odometerValue != null) childDevice.sendEvent(name: "odometer", value: data.odometerValue)
-    // Subaru's sentinel "no data" values (16383/32767) are documented as strings, but it's
-    // unconfirmed against live traffic whether every field always returns them as strings rather
-    // than numbers - comparing via toString() catches the sentinel either way.
-    if (data.avgFuelConsumptionMpg && data.avgFuelConsumptionMpg.toString() != "16383") childDevice.sendEvent(name: "avgFuelConsumption", value: data.avgFuelConsumptionMpg)
-    if (data.distanceToEmptyFuelMiles10s && data.distanceToEmptyFuelMiles10s.toString() != "16383") childDevice.sendEvent(name: "distanceToEmpty", value: data.distanceToEmptyFuelMiles10s)
+    // Subaru's API returns both imperial and native-metric fields (e.g. odometerValue and
+    // odometerValueKilometers). For CAN, read the metric fields directly rather than converting -
+    // Subaru's own km value is authoritative (matches the dash). Tire pressures are reported in PSI,
+    // so those are converted for CAN. Sentinels (16383/32767) may be string or number.
+    boolean metric = (settings.country == "CAN")
+
+    BigDecimal odo = asNum(metric ? data.odometerValueKilometers : data.odometerValue)
+    if (odo != null) childDevice.sendEvent(name: "odometer", value: odo, unit: metric ? "km" : "mi")
+
+    def fcRaw = metric ? data.avgFuelConsumptionLitersPer100Kilometers : data.avgFuelConsumptionMpg
+    BigDecimal fc = asNum(fcRaw)
+    if (fc != null && fcRaw.toString() != "16383") childDevice.sendEvent(name: "avgFuelConsumption", value: fc, unit: metric ? "L/100km" : "mpg")
+
+    def dteRaw = metric ? data.distanceToEmptyFuelKilometers10s : data.distanceToEmptyFuelMiles10s
+    BigDecimal dte = asNum(dteRaw)
+    if (dte != null && dteRaw.toString() != "16383") childDevice.sendEvent(name: "distanceToEmpty", value: dte, unit: metric ? "km" : "mi")
+
     if (data.vehicleStateType) childDevice.sendEvent(name: "vehicleState", value: data.vehicleStateType)
-    if (hasFeature(vin, "TPMS_MIL")) {
-        [tirePressureFrontLeftPsi: "tirePressureFL", tirePressureFrontRightPsi: "tirePressureFR",
-         tirePressureRearLeftPsi: "tirePressureRL", tirePressureRearRightPsi: "tirePressureRR"].each { apiKey, attr ->
-            if (data[apiKey] && data[apiKey].toString() != "32767") childDevice.sendEvent(name: attr, value: data[apiKey])
-        }
+
+    // Tire pressures come in PSI; convert to kPa for CAN. (Previously gated on a "TPMS_MIL" feature
+    // flag - unnecessary; subarulink applies no such gate. Values are null until the car reports.)
+    [tirePressureFrontLeftPsi: "tirePressureFL", tirePressureFrontRightPsi: "tirePressureFR",
+     tirePressureRearLeftPsi: "tirePressureRL", tirePressureRearRightPsi: "tirePressureRR"].each { apiKey, attr ->
+        BigDecimal psi = asNum(data[apiKey])
+        if (psi != null && data[apiKey].toString() != "32767") childDevice.sendEvent(name: attr, value: metric ? psiToKpa(psi) : psi, unit: metric ? "kPa" : "psi")
     }
-    if (data.latitude != null && data.longitude != null && data.latitude != 90 && data.longitude != 180) {
-        childDevice.sendEvent(name: "latitude", value: data.latitude)
-        childDevice.sendEvent(name: "longitude", value: data.longitude)
-        childDevice.sendEvent(name: "locationValid", value: "true")
-    }
+
+    // Location is emitted only from updateLocationAttributes (the locate payload). vehicleStatus and
+    // locate report the same coordinate at slightly different precision; emitting both flip-flopped
+    // the lat/long events on every refresh.
 }
+
+/* ---------------- Numeric helpers (Subaru reports PSI; gives native metric distance/fuel fields) ---------------- */
+
+private BigDecimal asNum(v) {
+    if (v == null) return null
+    try { return v as BigDecimal } catch (Exception ignored) { return null }
+}
+private BigDecimal psiToKpa(BigDecimal psi) { BigDecimal.valueOf(Math.round(psi.toDouble() * 6.894757d)) }
+private BigDecimal round5(BigDecimal v)     { v.setScale(5, BigDecimal.ROUND_HALF_UP) }
 
 private void updateConditionAttributes(childDevice, String vin, Map data) {
     [doorBootPosition: "doorBoot", doorEngineHoodPosition: "doorEngineHood",
@@ -422,14 +447,10 @@ private void updateConditionAttributes(childDevice, String vin, Map data) {
 
     if (data.remainingFuelPercent != null) childDevice.sendEvent(name: "fuelPercent", value: data.remainingFuelPercent)
 
-    List locks = [data.doorFrontLeftLockStatus, data.doorFrontRightLockStatus, data.doorRearLeftLockStatus, data.doorRearRightLockStatus].findAll { it }
-    if (locks) {
-        String lockState
-        if (locks.every { it == "LOCKED" }) lockState = "locked"
-        else if (locks.any { it == "UNLOCKED" }) lockState = "unlocked"
-        else lockState = "unknown"
-        childDevice.sendEvent(name: "lock", value: lockState)
-    }
+    // Lock status is intentionally NOT derived from polls. Subaru's API reports door lock status as
+    // UNKNOWN except right after a remote command (confirmed on-vehicle, and the Home Assistant
+    // reference integration notes lock status "is always unknown"). The lock attribute reflects the
+    // last commanded state, set in finishCommand(), so refreshes no longer clobber it to "unknown".
 
     [windowFrontLeftStatus: "windowFrontLeft", windowFrontRightStatus: "windowFrontRight",
      windowRearLeftStatus: "windowRearLeft", windowRearRightStatus: "windowRearRight",
@@ -449,9 +470,13 @@ private void updateConditionAttributes(childDevice, String vin, Map data) {
 }
 
 private void updateLocationAttributes(childDevice, Map data) {
-    if (data.latitude != null && data.longitude != null && data.latitude != 90 && data.longitude != 180) {
-        childDevice.sendEvent(name: "latitude", value: data.latitude)
-        childDevice.sendEvent(name: "longitude", value: data.longitude)
+    BigDecimal lat = asNum(data.latitude)
+    BigDecimal lon = asNum(data.longitude)
+    if (lat != null && lon != null && lat != 90 && lon != 180) {
+        // Round to ~1 m (5 dp). Subaru's cached fix jitters in the last decimals between reports,
+        // which would otherwise fire a new lat/long event on every refresh even while parked.
+        childDevice.sendEvent(name: "latitude", value: round5(lat))
+        childDevice.sendEvent(name: "longitude", value: round5(lon))
         childDevice.sendEvent(name: "locationValid", value: "true")
     } else {
         childDevice.sendEvent(name: "locationValid", value: "false")
