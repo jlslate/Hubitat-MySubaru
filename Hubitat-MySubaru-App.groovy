@@ -227,7 +227,10 @@ def initialize() {
     }
 }
 
-def scheduledPoll() {
+// evt is unused and only present because the systemStart subscription below dispatches with
+// an Event argument, while runIn's self-reschedule calls this with none - the default makes
+// both call shapes resolve to the same method.
+def scheduledPoll(evt = null) {
     // Schedule the next run first so one bad cycle (a flaky vendor API, a thrown exception)
     // can't silently kill the polling loop - only the reschedule call below guarantees that.
     Integer mins = Math.max(5, (settings.pollIntervalMinutes ?: 30) as Integer)
