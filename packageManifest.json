@@ -2,9 +2,9 @@
   "packageName": "MySubaru",
   "author": "jlslate",
   "minimumHEVersion": "2.3.4",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "dateReleased": "2026-07-22",
-  "releaseNotes": "Fix a post-reboot MissingMethodException: the systemStart subscription added in 1.1.0 dispatches scheduledPoll with an Event argument, but it was declared with none. scheduledPoll now takes an optional/unused event parameter so both the runIn self-reschedule (0 args) and the systemStart subscription (1 arg) resolve correctly.",
+  "releaseNotes": "Polish pass from the same community code review: added a CODE_VERSION constant shown in the app UI, split logging into txtEnable/debugEnable/traceEnable (debug and trace auto-disable after 30 minutes), gave component* methods explicit void return types, stopped logging raw cookie values (now logs cookie names only, at trace level), and made the 16383/32767 sentinel-value checks type-safe against either string or numeric API responses.",
   "documentationLink": "https://github.com/jlslate/Hubitat-MySubaru",
   "apps": [
     {

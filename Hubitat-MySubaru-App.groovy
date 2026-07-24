@@ -64,6 +64,10 @@ import groovy.json.JsonSlurper
 
 @Field static final String DOOR_ALL = "ALL_DOORS_CMD"
 
+// Kept in sync with packageManifest.json's version - shown in the UI and logs to make it
+// easy to tell which release someone's running when troubleshooting.
+@Field static final String CODE_VERSION = "1.2.0"
+
 definition(
     name: "Subaru Connect",
     namespace: "jlslate",
@@ -81,6 +85,9 @@ preferences {
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Subaru Connect", install: canInstall(), uninstall: true) {
+        section {
+            paragraph "Subaru Connect v${CODE_VERSION}"
+        }
         section("MySubaru Account") {
             input name: "subaruUsername", type: "text", title: "MySubaru Username/Email", required: true, submitOnChange: true
             input name: "subaruPassword", type: "password", title: "MySubaru Password", required: true, submitOnChange: true
@@ -115,7 +122,9 @@ def mainPage() {
         }
         section("Options") {
             input name: "pollIntervalMinutes", type: "number", title: "Status refresh interval (minutes, minimum 5). This only pulls cached data from Subaru's servers - it does not wake up the car.", defaultValue: 30, range: "5..1440"
-            input name: "enableLogging", type: "bool", title: "Enable debug logging", defaultValue: false
+            input name: "txtEnable", type: "bool", title: "Enable descriptive text logging", defaultValue: true
+            input name: "debugEnable", type: "bool", title: "Enable debug logging", defaultValue: false
+            input name: "traceEnable", type: "bool", title: "Enable trace logging (very verbose - raw HTTP/session detail)", defaultValue: false
         }
         if (state.pinLockout) {
             section("PIN Locked Out") {
@@ -201,17 +210,32 @@ private void handleVerifyCode() {
 }
 
 def installed() {
-    log.info "Subaru Connect installed"
+    logTxt "Subaru Connect v${CODE_VERSION} installed"
+    manageLogging()
     initialize()
 }
 
 def updated() {
-    log.info "Subaru Connect updated"
+    logTxt "Subaru Connect v${CODE_VERSION} updated"
     unschedule()
     unsubscribe()
     if (state.savedPin != null && settings.subaruPin != state.savedPin) state.pinLockout = false
     state.savedPin = settings.subaruPin
+    manageLogging()
     initialize()
+}
+
+// Auto-disables debug/trace logging after 30 minutes so it doesn't run indefinitely once
+// someone turns it on to troubleshoot and forgets about it.
+private void manageLogging() {
+    unschedule("logsOff")
+    if (debugEnable || traceEnable) runIn(1800, "logsOff")
+}
+
+def logsOff() {
+    log.warn "Debug/trace logging disabled after 30 minutes"
+    app.updateSetting("debugEnable", [value: "false", type: "bool"])
+    app.updateSetting("traceEnable", [value: "false", type: "bool"])
 }
 
 def uninstalled() {
@@ -260,7 +284,7 @@ private void createChildDevices() {
 
 /* ---------------- Component commands, called by the child driver ---------------- */
 
-def componentRefresh(childDevice) {
+void componentRefresh(childDevice) {
     String vin = childDevice.getDataValue("vin")
     if (!vin) return
     if (!ensureSession(vin)) {
@@ -282,41 +306,41 @@ def componentRefresh(childDevice) {
     if (hasRemoteStart(vin) || isEv(vin)) fetchPresets(childDevice, vin)
 }
 
-def componentLock(childDevice) {
+void componentLock(childDevice) {
     String vin = childDevice.getDataValue("vin")
     executeRemoteCommand(childDevice, vin, API_LOCK, [forceKeyInCar: false], null, "LOCK")
 }
 
-def componentUnlock(childDevice, String door = DOOR_ALL) {
+void componentUnlock(childDevice, String door = DOOR_ALL) {
     String vin = childDevice.getDataValue("vin")
     executeRemoteCommand(childDevice, vin, API_UNLOCK, [unlockDoorType: door], null, "UNLOCK")
 }
 
-def componentHornAndLights(childDevice) {
+void componentHornAndLights(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String poll = effectiveApiGen(vin) == "g1" ? API_G1_HORN_LIGHTS_STATUS : API_REMOTE_SVC_STATUS
     executeRemoteCommand(childDevice, vin, API_HORN_LIGHTS, [:], poll)
 }
 
-def componentStopHornAndLights(childDevice) {
+void componentStopHornAndLights(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String poll = effectiveApiGen(vin) == "g1" ? API_G1_HORN_LIGHTS_STATUS : API_REMOTE_SVC_STATUS
     executeRemoteCommand(childDevice, vin, API_HORN_LIGHTS_STOP, [:], poll)
 }
 
-def componentFlashLights(childDevice) {
+void componentFlashLights(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String poll = effectiveApiGen(vin) == "g1" ? API_G1_HORN_LIGHTS_STATUS : API_REMOTE_SVC_STATUS
     executeRemoteCommand(childDevice, vin, API_LIGHTS, [:], poll)
 }
 
-def componentStopFlashLights(childDevice) {
+void componentStopFlashLights(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String poll = effectiveApiGen(vin) == "g1" ? API_G1_HORN_LIGHTS_STATUS : API_REMOTE_SVC_STATUS
     executeRemoteCommand(childDevice, vin, API_LIGHTS_STOP, [:], poll)
 }
 
-def componentLocate(childDevice) {
+void componentLocate(childDevice) {
     String vin = childDevice.getDataValue("vin")
     String gen = effectiveApiGen(vin)
     String url = gen == "g1" ? API_G1_LOCATE_UPDATE : API_G2_LOCATE_UPDATE
@@ -324,7 +348,7 @@ def componentLocate(childDevice) {
     executeRemoteCommand(childDevice, vin, url, [:], poll, "LOCATE")
 }
 
-def componentRemoteStop(childDevice) {
+void componentRemoteStop(childDevice) {
     String vin = childDevice.getDataValue("vin")
     if (!(hasRemoteStart(vin) || isEv(vin))) {
         logWarn "Remote stop not supported on ${vin}"
@@ -333,7 +357,7 @@ def componentRemoteStop(childDevice) {
     executeRemoteCommand(childDevice, vin, API_G2_REMOTE_ENGINE_STOP)
 }
 
-def componentRemoteStart(childDevice, String presetName) {
+void componentRemoteStart(childDevice, String presetName) {
     String vin = childDevice.getDataValue("vin")
     if (!hasRemoteStart(vin)) {
         logWarn "Remote start not supported on ${vin}"
@@ -357,7 +381,7 @@ def componentRemoteStart(childDevice, String presetName) {
     executeRemoteCommand(childDevice, vin, API_G2_REMOTE_ENGINE_START, preset)
 }
 
-def componentChargeStart(childDevice) {
+void componentChargeStart(childDevice) {
     String vin = childDevice.getDataValue("vin")
     if (!isEv(vin)) {
         logWarn "Charge start not supported on ${vin}"
@@ -370,13 +394,16 @@ def componentChargeStart(childDevice) {
 
 private void updateStatusAttributes(childDevice, String vin, Map data) {
     if (data.odometerValue != null) childDevice.sendEvent(name: "odometer", value: data.odometerValue)
-    if (data.avgFuelConsumptionMpg && data.avgFuelConsumptionMpg != "16383") childDevice.sendEvent(name: "avgFuelConsumption", value: data.avgFuelConsumptionMpg)
-    if (data.distanceToEmptyFuelMiles10s && data.distanceToEmptyFuelMiles10s != "16383") childDevice.sendEvent(name: "distanceToEmpty", value: data.distanceToEmptyFuelMiles10s)
+    // Subaru's sentinel "no data" values (16383/32767) are documented as strings, but it's
+    // unconfirmed against live traffic whether every field always returns them as strings rather
+    // than numbers - comparing via toString() catches the sentinel either way.
+    if (data.avgFuelConsumptionMpg && data.avgFuelConsumptionMpg.toString() != "16383") childDevice.sendEvent(name: "avgFuelConsumption", value: data.avgFuelConsumptionMpg)
+    if (data.distanceToEmptyFuelMiles10s && data.distanceToEmptyFuelMiles10s.toString() != "16383") childDevice.sendEvent(name: "distanceToEmpty", value: data.distanceToEmptyFuelMiles10s)
     if (data.vehicleStateType) childDevice.sendEvent(name: "vehicleState", value: data.vehicleStateType)
     if (hasFeature(vin, "TPMS_MIL")) {
         [tirePressureFrontLeftPsi: "tirePressureFL", tirePressureFrontRightPsi: "tirePressureFR",
          tirePressureRearLeftPsi: "tirePressureRL", tirePressureRearRightPsi: "tirePressureRR"].each { apiKey, attr ->
-            if (data[apiKey] && data[apiKey] != "32767") childDevice.sendEvent(name: attr, value: data[apiKey])
+            if (data[apiKey] && data[apiKey].toString() != "32767") childDevice.sendEvent(name: attr, value: data[apiKey])
         }
     }
     if (data.latitude != null && data.longitude != null && data.latitude != 90 && data.longitude != 180) {
@@ -750,7 +777,8 @@ private void captureCookies(resp) {
         }
         state.cookieJar = jar
         state.cookies = jar.collect { k, v -> "${k}=${v}" }.join("; ")
-        logDebug "Cookie jar now: ${state.cookies}"
+        // Names only - never log cookie values, they're live session credentials.
+        logTrace "Cookie jar now has ${jar.size()} cookie(s): ${jar.keySet()}"
     } catch (Exception e) {
         logDebug "captureCookies error: ${e.message}"
     }
@@ -782,6 +810,7 @@ private void captureCookiesFromAsync(resp) {
         }
         state.cookieJar = jar
         state.cookies = jar.collect { k, v -> "${k}=${v}" }.join("; ")
+        logTrace "Cookie jar now has ${jar.size()} cookie(s): ${jar.keySet()}"
     } catch (Exception e) {
         logDebug "captureCookiesFromAsync error: ${e.message}"
     }
@@ -890,8 +919,16 @@ private Map subaruPostJson(String path, Map jsonBody) {
     }
 }
 
+private void logTxt(String msg) {
+    if (settings.txtEnable) log.info msg
+}
+
 private void logDebug(String msg) {
-    if (settings.enableLogging) log.debug msg
+    if (settings.debugEnable) log.debug msg
+}
+
+private void logTrace(String msg) {
+    if (settings.traceEnable) log.trace msg
 }
 
 private void logWarn(String msg) {
