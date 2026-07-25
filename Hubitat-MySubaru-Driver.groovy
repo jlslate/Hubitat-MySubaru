@@ -29,6 +29,7 @@ metadata {
         command "flashLights"
         command "stopFlashLights"
         command "locate"
+        command "updateFromVehicle"
         command "remoteStart", [[name: "presetName*", type: "STRING", description: "Climate preset name, as saved in the MySubaru app (see the 'presets' attribute for available names)"]]
         command "remoteStop"
         command "chargeStart"
@@ -113,6 +114,10 @@ def stopFlashLights() {
 
 def locate() {
     parent?.componentLocate(device)
+}
+
+def updateFromVehicle() {
+    parent?.componentUpdateFromVehicle(device)
 }
 
 def remoteStart(String presetName) {

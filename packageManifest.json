@@ -2,9 +2,9 @@
   "packageName": "MySubaru",
   "author": "jlslate",
   "minimumHEVersion": "2.3.4",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "dateReleased": "2026-07-24",
-  "releaseNotes": "Vehicle-status fixes: lock state now reflects the last command instead of reverting to 'unknown' on every refresh (Subaru's API doesn't report lock status via polling); removed a feature-flag gate that hid tire pressures; Canadian accounts now use Subaru's native metric fields (km, L/100km) with tire pressures in kPa and unit labels on all values; and GPS location is now emitted from a single source and rounded, ending the constant lat/long event churn caused by two payloads reporting slightly different precision.",
+  "releaseNotes": "Adds an 'Update from vehicle' command that actively wakes the car to report fresh telematics, then pulls the refreshed odometer, tire pressures, location, and vehicle state (the normal refresh only reads Subaru's cached data). Manual-only and throttled to protect the 12V battery. Also includes the prior vehicle-status fixes: lock state no longer reverts to 'unknown' on refresh, native metric fields for Canadian accounts, and single-source rounded GPS to stop lat/long event churn.",
   "documentationLink": "https://github.com/jlslate/Hubitat-MySubaru",
   "apps": [
     {

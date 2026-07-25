@@ -66,7 +66,7 @@ import groovy.json.JsonSlurper
 
 // Kept in sync with packageManifest.json's version - shown in the UI and logs to make it
 // easy to tell which release someone's running when troubleshooting.
-@Field static final String CODE_VERSION = "1.3.0"
+@Field static final String CODE_VERSION = "1.4.0"
 
 definition(
     name: "Subaru Connect",
@@ -350,6 +350,43 @@ void componentLocate(childDevice) {
     String url = gen == "g1" ? API_G1_LOCATE_UPDATE : API_G2_LOCATE_UPDATE
     String poll = gen == "g1" ? API_G1_LOCATE_STATUS : API_G2_LOCATE_STATUS
     executeRemoteCommand(childDevice, vin, url, [:], poll, "LOCATE")
+}
+
+// Active "update from vehicle": wakes the car to report fresh telematics (~30s), then pulls the
+// refreshed cached data. Uses the same locate/execute flow as componentLocate; the "UPDATE" kind
+// tells finishCommand to run a follow-up refresh. Throttled and manual-only - it nibbles the 12V
+// battery, so it must never run on the poll schedule.
+@Field static final long ACTIVE_UPDATE_THROTTLE_MS = 300000L
+
+void componentUpdateFromVehicle(childDevice) {
+    String vin = childDevice.getDataValue("vin")
+    if (!hasRemoteService(vin)) {
+        logWarn "Update from vehicle needs an active remote subscription (${vin})"
+        childDevice.sendEvent(name: "lastCommandResult", value: "failed: no remote subscription")
+        return
+    }
+    Map lastMap = (state.lastActiveUpdate ?: [:]) as Map
+    long sinceMs = now() - ((lastMap[vin] ?: 0L) as long)
+    if (sinceMs < ACTIVE_UPDATE_THROTTLE_MS) {
+        int waitS = ((ACTIVE_UPDATE_THROTTLE_MS - sinceMs) / 1000L) as int
+        logTxt "Update from vehicle throttled - retry in ${waitS}s (protects the 12V battery)"
+        childDevice.sendEvent(name: "lastCommandResult", value: "throttled: retry in ${waitS}s")
+        return
+    }
+    lastMap[vin] = now()
+    state.lastActiveUpdate = lastMap
+    String gen = effectiveApiGen(vin)
+    String url = gen == "g1" ? API_G1_LOCATE_UPDATE : API_G2_LOCATE_UPDATE
+    String poll = gen == "g1" ? API_G1_LOCATE_STATUS : API_G2_LOCATE_STATUS
+    logTxt "Requesting active update from vehicle ${vin} - wakes the car, ~30s"
+    executeRemoteCommand(childDevice, vin, url, [:], poll, "UPDATE")
+}
+
+// Follow-up after an active update completes: the car has reported to Subaru's servers, so a normal
+// cached refresh now returns fresh odometer / tire pressures / vehicle state.
+def refreshAfterActiveUpdate(Map data) {
+    def cd = getChildDevice(data.dni as String)
+    if (cd) componentRefresh(cd)
 }
 
 void componentRemoteStop(childDevice) {
@@ -738,6 +775,12 @@ private void finishCommand(Map ctx, Map result) {
             break
         case "LOCATE":
             if (result?.success && result?.result) updateLocationAttributes(childDevice, result.result as Map)
+            break
+        case "UPDATE":
+            if (result?.success && result?.result) updateLocationAttributes(childDevice, result.result as Map)
+            // Car has now reported fresh telematics; pull the refreshed cached data after a short
+            // settle delay (odometer / tire pressures / vehicle state).
+            if (result?.success) runInMillis(3000, "refreshAfterActiveUpdate", [data: [dni: ctx.dni], overwrite: false])
             break
     }
 }
