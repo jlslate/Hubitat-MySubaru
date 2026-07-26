@@ -73,9 +73,9 @@ metadata {
         attribute "warningStatus", "string"
         attribute "warningLampsActive", "number"
         attribute "warningLamps", "string"
-        attribute "milCheckEngine", "string"
-        attribute "milWasherFluid", "string"
-        attribute "milTpms", "string"
+        attribute "checkEngine", "string"
+        attribute "washerFluid", "string"
+        attribute "tirePressureWarning", "string"
     }
 }
 

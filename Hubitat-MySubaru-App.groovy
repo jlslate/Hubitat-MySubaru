@@ -70,7 +70,7 @@ import groovy.json.JsonSlurper
 
 // Warning lamps worth their own attribute (highest home-automation value); every other lamp still
 // rolls up into warningLamps/warningLampsActive. Keyed by the API's featureCode.
-@Field static final Map HEALTH_CURATED = ["CEL_MIL": "milCheckEngine", "WASH_MIL": "milWasherFluid", "TPMS_MIL": "milTpms"]
+@Field static final Map HEALTH_CURATED = ["CEL_MIL": "checkEngine", "WASH_MIL": "washerFluid", "TPMS_MIL": "tirePressureWarning"]
 
 // Kept in sync with packageManifest.json's version - shown in the UI and logs to make it
 // easy to tell which release someone's running when troubleshooting.
@@ -561,13 +561,13 @@ private void updateHealthAttributes(childDevice, String vin, List items) {
     List applicable = items.findAll { it instanceof Map && it.featureCode && (feats.isEmpty() || feats.contains(it.featureCode)) }
     List active = applicable.findAll { isTroubleFlag(it.isTrouble) }
 
-    childDevice.sendEvent(name: "warningStatus", value: active ? "attention" : "ok")
+    childDevice.sendEvent(name: "warningStatus", value: active ? "warning" : "clear")
     childDevice.sendEvent(name: "warningLampsActive", value: active.size())
     childDevice.sendEvent(name: "warningLamps", value: active.collect { it.b2cCode ?: it.featureCode }.join(", "))
 
     HEALTH_CURATED.each { code, attr ->
         def item = applicable.find { it.featureCode == code }
-        if (item != null) childDevice.sendEvent(name: attr, value: isTroubleFlag(item.isTrouble) ? "active" : "clear")
+        if (item != null) childDevice.sendEvent(name: attr, value: isTroubleFlag(item.isTrouble) ? "warning" : "clear")
     }
 }
 
