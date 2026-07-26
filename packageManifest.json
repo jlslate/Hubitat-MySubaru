@@ -2,9 +2,9 @@
   "packageName": "MySubaru",
   "author": "jlslate",
   "minimumHEVersion": "2.3.4",
-  "version": "1.5.0",
-  "dateReleased": "2026-07-25",
-  "releaseNotes": "Adds vehicle-health warning lamps: a rolled-up warningStatus / warningLampsActive / warningLamps plus dedicated check-engine, washer-fluid, and TPMS attributes, so you can automate on a lit dashboard light. Also surfaces the manufacturer-recommended front/rear tire pressures, and stops a not-charging EV from reporting the 65535 sentinel as a real time-to-full reading.",
+  "version": "1.3.0",
+  "dateReleased": "2026-07-26",
+  "releaseNotes": "Adds vehicle-health warning lamps (a rolled-up warningStatus / warningLampsActive / warningLamps plus dedicated check-engine, washer-fluid, and TPMS attributes), manufacturer-recommended front/rear tire pressures, and an 'update from vehicle' command that wakes the car for a live reading. Reports metric units for Canadian accounts. Fixes lock state reverting to unknown on refresh, GPS event churn on every refresh, and a not-charging EV reporting the 65535 sentinel as a real time-to-full reading.",
   "documentationLink": "https://github.com/jlslate/Hubitat-MySubaru",
   "apps": [
     {

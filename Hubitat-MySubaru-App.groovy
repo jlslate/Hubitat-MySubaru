@@ -74,7 +74,7 @@ import groovy.json.JsonSlurper
 
 // Kept in sync with packageManifest.json's version - shown in the UI and logs to make it
 // easy to tell which release someone's running when troubleshooting.
-@Field static final String CODE_VERSION = "1.5.0"
+@Field static final String CODE_VERSION = "1.3.0"
 
 definition(
     name: "Subaru Connect",
