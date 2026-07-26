@@ -62,11 +62,19 @@ import groovy.json.JsonSlurper
 
 @Field static final String API_EV_CHARGE_NOW = "/service/g2/phevChargeNow/execute.json"
 
+// Vehicle-health / warning-lamp status. Plain GET at the API base (not under /service), no PIN.
+// Returns data.vehicleHealthItems[] where each item has featureCode / isTrouble / onDates.
+@Field static final String API_VEHICLE_HEALTH = "/vehicleHealth.json"
+
 @Field static final String DOOR_ALL = "ALL_DOORS_CMD"
+
+// Warning lamps worth their own attribute (highest home-automation value); every other lamp still
+// rolls up into warningLamps/warningLampsActive. Keyed by the API's featureCode.
+@Field static final Map HEALTH_CURATED = ["CEL_MIL": "milCheckEngine", "WASH_MIL": "milWasherFluid", "TPMS_MIL": "milTpms"]
 
 // Kept in sync with packageManifest.json's version - shown in the UI and logs to make it
 // easy to tell which release someone's running when troubleshooting.
-@Field static final String CODE_VERSION = "1.4.0"
+@Field static final String CODE_VERSION = "1.5.0"
 
 definition(
     name: "Subaru Connect",
@@ -74,6 +82,8 @@ definition(
     author: "jlslate (slate)",
     description: "Links your MySubaru STARLINK account to Hubitat: lock/unlock, horn/lights, remote start/stop, and vehicle status for each enrolled vehicle",
     category: "Convenience",
+    menu: "Integrations",
+    importUrl: "https://raw.githubusercontent.com/jlslate/Hubitat-MySubaru/main/Hubitat-MySubaru-App.groovy",
     iconUrl: "",
     iconX2Url: "",
     iconX3Url: ""
@@ -305,6 +315,11 @@ void componentRefresh(childDevice) {
 
         Map locateResp = subaruGet(API_LOCATE.replace("api_gen", gen))
         if (locateResp?.success && locateResp.data?.result) updateLocationAttributes(childDevice, locateResp.data.result as Map)
+
+        Map healthResp = subaruGet(API_VEHICLE_HEALTH)
+        if (healthResp?.data instanceof Map && healthResp.data.vehicleHealthItems instanceof List) {
+            updateHealthAttributes(childDevice, vin, healthResp.data.vehicleHealthItems as List)
+        }
     }
 
     if (hasRemoteStart(vin) || isEv(vin)) fetchPresets(childDevice, vin)
@@ -464,6 +479,21 @@ private void updateStatusAttributes(childDevice, String vin, Map data) {
     // Location is emitted only from updateLocationAttributes (the locate payload). vehicleStatus and
     // locate report the same coordinate at slightly different precision; emitting both flip-flopped
     // the lat/long events on every refresh.
+
+    emitRecommendedTirePressure(childDevice, vin)
+}
+
+// Manufacturer-recommended cold tire pressure, encoded in the vehicle's feature flags as
+// "TIF_<psi>" (front) / "TIR_<psi>" (rear) - no separate API call needed. PSI -> kPa for CAN.
+private void emitRecommendedTirePressure(childDevice, String vin) {
+    boolean metric = (settings.country == "CAN")
+    List feats = state.vehicles[vin]?.features ?: []
+    def front = feats.find { it?.startsWith("TIF_") }
+    def rear  = feats.find { it?.startsWith("TIR_") }
+    BigDecimal fp = front ? asNum(front.tokenize("_").getAt(1)) : null
+    BigDecimal rp = rear  ? asNum(rear.tokenize("_").getAt(1)) : null
+    if (fp != null) childDevice.sendEvent(name: "recommendedTirePressureFront", value: metric ? psiToKpa(fp) : fp, unit: metric ? "kPa" : "psi")
+    if (rp != null) childDevice.sendEvent(name: "recommendedTirePressureRear",  value: metric ? psiToKpa(rp) : rp, unit: metric ? "kPa" : "psi")
 }
 
 /* ---------------- Numeric helpers (Subaru reports PSI; gives native metric distance/fuel fields) ---------------- */
@@ -500,7 +530,9 @@ private void updateConditionAttributes(childDevice, String vin, Map data) {
         if (data.evIsPluggedIn) childDevice.sendEvent(name: "evPluggedIn", value: data.evIsPluggedIn)
         if (data.evChargerStateType) childDevice.sendEvent(name: "evChargerState", value: data.evChargerStateType)
         if (data.evDistanceToEmpty != null) childDevice.sendEvent(name: "evDistanceToEmpty", value: data.evDistanceToEmpty)
-        if (data.evTimeToFullyCharged != null) childDevice.sendEvent(name: "evTimeToFullyCharged", value: data.evTimeToFullyCharged)
+        // 65535 is Subaru's "no valid reading" sentinel for time-to-full (e.g. not charging) - skip it,
+        // same handling as the 16383/32767 sentinels above.
+        if (data.evTimeToFullyCharged != null && data.evTimeToFullyCharged.toString() != "65535") childDevice.sendEvent(name: "evTimeToFullyCharged", value: data.evTimeToFullyCharged)
     }
 
     if (data.lastUpdatedTime) childDevice.sendEvent(name: "lastUpdated", value: data.lastUpdatedTime)
@@ -518,6 +550,30 @@ private void updateLocationAttributes(childDevice, Map data) {
     } else {
         childDevice.sendEvent(name: "locationValid", value: "false")
     }
+}
+
+// Vehicle-health warning lamps. The endpoint returns every lamp the platform knows about; we keep
+// only the ones this vehicle actually advertises in its feature list (mirrors subarulink), roll the
+// active ones up into warningStatus/warningLampsActive/warningLamps, and surface a curated few as
+// their own attributes for direct RM/dashboard use. Each item: featureCode, isTrouble, onDates.
+private void updateHealthAttributes(childDevice, String vin, List items) {
+    List feats = state.vehicles[vin]?.features ?: []
+    List applicable = items.findAll { it instanceof Map && it.featureCode && (feats.isEmpty() || feats.contains(it.featureCode)) }
+    List active = applicable.findAll { isTroubleFlag(it.isTrouble) }
+
+    childDevice.sendEvent(name: "warningStatus", value: active ? "attention" : "ok")
+    childDevice.sendEvent(name: "warningLampsActive", value: active.size())
+    childDevice.sendEvent(name: "warningLamps", value: active.collect { it.b2cCode ?: it.featureCode }.join(", "))
+
+    HEALTH_CURATED.each { code, attr ->
+        def item = applicable.find { it.featureCode == code }
+        if (item != null) childDevice.sendEvent(name: attr, value: isTroubleFlag(item.isTrouble) ? "active" : "clear")
+    }
+}
+
+// Defensive: the API returns a JSON boolean, but tolerate a stringified "true" just in case.
+private boolean isTroubleFlag(v) {
+    v == true || v?.toString()?.equalsIgnoreCase("true")
 }
 
 private void fetchPresets(childDevice, String vin) {

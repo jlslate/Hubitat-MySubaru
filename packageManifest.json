@@ -2,9 +2,9 @@
   "packageName": "MySubaru",
   "author": "jlslate",
   "minimumHEVersion": "2.3.4",
-  "version": "1.4.0",
-  "dateReleased": "2026-07-24",
-  "releaseNotes": "Adds an 'Update from vehicle' command that actively wakes the car to report fresh telematics, then pulls the refreshed odometer, tire pressures, location, and vehicle state (the normal refresh only reads Subaru's cached data). Manual-only and throttled to protect the 12V battery. Also includes the prior vehicle-status fixes: lock state no longer reverts to 'unknown' on refresh, native metric fields for Canadian accounts, and single-source rounded GPS to stop lat/long event churn.",
+  "version": "1.5.0",
+  "dateReleased": "2026-07-25",
+  "releaseNotes": "Adds vehicle-health warning lamps: a rolled-up warningStatus / warningLampsActive / warningLamps plus dedicated check-engine, washer-fluid, and TPMS attributes, so you can automate on a lit dashboard light. Also surfaces the manufacturer-recommended front/rear tire pressures, and stops a not-charging EV from reporting the 65535 sentinel as a real time-to-full reading.",
   "documentationLink": "https://github.com/jlslate/Hubitat-MySubaru",
   "apps": [
     {

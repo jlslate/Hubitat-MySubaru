@@ -16,7 +16,8 @@
  */
 
 metadata {
-    definition(name: "Subaru Vehicle", namespace: "jlslate", author: "jlslate (slate)") {
+    definition(name: "Subaru Vehicle", namespace: "jlslate", author: "jlslate (slate)",
+               importUrl: "https://raw.githubusercontent.com/jlslate/Hubitat-MySubaru/main/Hubitat-MySubaru-Driver.groovy") {
         capability "Lock"
         capability "Refresh"
         capability "Actuator"
@@ -56,6 +57,8 @@ metadata {
         attribute "tirePressureFR", "number"
         attribute "tirePressureRL", "number"
         attribute "tirePressureRR", "number"
+        attribute "recommendedTirePressureFront", "number"
+        attribute "recommendedTirePressureRear", "number"
         attribute "latitude", "number"
         attribute "longitude", "number"
         attribute "locationValid", "string"
@@ -67,6 +70,12 @@ metadata {
         attribute "presets", "string"
         attribute "lastUpdated", "string"
         attribute "lastCommandResult", "string"
+        attribute "warningStatus", "string"
+        attribute "warningLampsActive", "number"
+        attribute "warningLamps", "string"
+        attribute "milCheckEngine", "string"
+        attribute "milWasherFluid", "string"
+        attribute "milTpms", "string"
     }
 }
 
