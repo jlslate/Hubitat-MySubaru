@@ -317,7 +317,7 @@ void componentRefresh(childDevice) {
         if (locateResp?.success && locateResp.data?.result) updateLocationAttributes(childDevice, locateResp.data.result as Map)
 
         Map healthResp = subaruGet(API_VEHICLE_HEALTH)
-        if (healthResp?.data instanceof Map && healthResp.data.vehicleHealthItems instanceof List) {
+        if (healthResp?.success && healthResp.data instanceof Map && healthResp.data.vehicleHealthItems instanceof List) {
             updateHealthAttributes(childDevice, vin, healthResp.data.vehicleHealthItems as List)
         }
     }
@@ -468,13 +468,15 @@ private void updateStatusAttributes(childDevice, String vin, Map data) {
 
     if (data.vehicleStateType) childDevice.sendEvent(name: "vehicleState", value: data.vehicleStateType)
 
-    // Tire pressures come in PSI; convert to kPa for CAN. No feature gate here: values are skipped
-    // while null or the 32767 sentinel (below), so vehicles without TPMS simply never emit. (subarulink
-    // does gate this, on a TPMS-capability check; we rely on value presence instead of a feature flag.)
-    [tirePressureFrontLeftPsi: "tirePressureFL", tirePressureFrontRightPsi: "tirePressureFR",
-     tirePressureRearLeftPsi: "tirePressureRL", tirePressureRearRightPsi: "tirePressureRR"].each { apiKey, attr ->
-        BigDecimal psi = asNum(data[apiKey])
-        if (psi != null && data[apiKey].toString() != "32767") childDevice.sendEvent(name: attr, value: metric ? psiToKpa(psi) : psi, unit: metric ? "kPa" : "psi")
+    // Tire pressures come in PSI; convert to kPa for CAN. Gated on the TPMS feature flag, matching the
+    // reference implementation's capability check, plus a value guard: 32767 is the "no reading"
+    // sentinel and the fields are null on vehicles that carry the feature but report no pressures.
+    if (hasFeature(vin, "TPMS_MIL")) {
+        [tirePressureFrontLeftPsi: "tirePressureFL", tirePressureFrontRightPsi: "tirePressureFR",
+         tirePressureRearLeftPsi: "tirePressureRL", tirePressureRearRightPsi: "tirePressureRR"].each { apiKey, attr ->
+            BigDecimal psi = asNum(data[apiKey])
+            if (psi != null && data[apiKey].toString() != "32767") childDevice.sendEvent(name: attr, value: metric ? psiToKpa(psi) : psi, unit: metric ? "kPa" : "psi")
+        }
     }
 
     // Location: prefer the locate payload, which componentRefresh fetches for remote-service G2
@@ -494,10 +496,11 @@ private void updateStatusAttributes(childDevice, String vin, Map data) {
 private void emitRecommendedTirePressure(childDevice, String vin) {
     boolean metric = (settings.country == "CAN")
     List feats = state.vehicles[vin]?.features ?: []
-    def front = feats.find { it?.startsWith("TIF_") }
-    def rear  = feats.find { it?.startsWith("TIR_") }
-    BigDecimal fp = front ? asNum(front.tokenize("_").getAt(1)) : null
-    BigDecimal rp = rear  ? asNum(rear.tokenize("_").getAt(1)) : null
+    // Exactly one flag each, as the reference requires - multiple would be ambiguous, so emit nothing.
+    List front = feats.findAll { it?.startsWith("TIF_") }
+    List rear  = feats.findAll { it?.startsWith("TIR_") }
+    BigDecimal fp = front.size() == 1 ? asNum(front[0].tokenize("_").getAt(1)) : null
+    BigDecimal rp = rear.size()  == 1 ? asNum(rear[0].tokenize("_").getAt(1))  : null
     if (fp != null) childDevice.sendEvent(name: "recommendedTirePressureFront", value: metric ? psiToKpa(fp) : fp, unit: metric ? "kPa" : "psi")
     if (rp != null) childDevice.sendEvent(name: "recommendedTirePressureRear",  value: metric ? psiToKpa(rp) : rp, unit: metric ? "kPa" : "psi")
 }
@@ -525,13 +528,14 @@ private void updateConditionAttributes(childDevice, String vin, Map data) {
     // clobbered the command-set value every refresh. When the poll is indeterminate we leave the
     // attribute untouched, so the last commanded state (set in finishCommand) persists. Vehicles that
     // do report real polled status will reflect it, including a lock/unlock done with the physical fob.
+    // Only LOCKED/UNLOCKED are real readings; UNKNOWN and NOT_EQUIPPED are placeholders (a door the
+    // car doesn't have still reports). Ignoring them keeps a NOT_EQUIPPED door from suppressing an
+    // otherwise conclusive result.
     List lockStatuses = [data.doorFrontLeftLockStatus, data.doorFrontRightLockStatus,
-                         data.doorRearLeftLockStatus, data.doorRearRightLockStatus].findAll { it }
+                         data.doorRearLeftLockStatus, data.doorRearRightLockStatus]
+                        .findAll { it in ["LOCKED", "UNLOCKED"] }
     if (lockStatuses) {
-        String lockState = null
-        if (lockStatuses.every { it == "LOCKED" }) lockState = "locked"
-        else if (lockStatuses.any { it == "UNLOCKED" }) lockState = "unlocked"
-        if (lockState) childDevice.sendEvent(name: "lock", value: lockState)
+        childDevice.sendEvent(name: "lock", value: lockStatuses.contains("UNLOCKED") ? "unlocked" : "locked")
     }
 
     [windowFrontLeftStatus: "windowFrontLeft", windowFrontRightStatus: "windowFrontRight",
