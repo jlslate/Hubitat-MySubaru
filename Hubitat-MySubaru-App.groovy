@@ -468,8 +468,9 @@ private void updateStatusAttributes(childDevice, String vin, Map data) {
 
     if (data.vehicleStateType) childDevice.sendEvent(name: "vehicleState", value: data.vehicleStateType)
 
-    // Tire pressures come in PSI; convert to kPa for CAN. (Previously gated on a "TPMS_MIL" feature
-    // flag - unnecessary; subarulink applies no such gate. Values are null until the car reports.)
+    // Tire pressures come in PSI; convert to kPa for CAN. No feature gate here: values are skipped
+    // while null or the 32767 sentinel (below), so vehicles without TPMS simply never emit. (subarulink
+    // does gate this, on a TPMS-capability check; we rely on value presence instead of a feature flag.)
     [tirePressureFrontLeftPsi: "tirePressureFL", tirePressureFrontRightPsi: "tirePressureFR",
      tirePressureRearLeftPsi: "tirePressureRL", tirePressureRearRightPsi: "tirePressureRR"].each { apiKey, attr ->
         BigDecimal psi = asNum(data[apiKey])
@@ -514,10 +515,19 @@ private void updateConditionAttributes(childDevice, String vin, Map data) {
 
     if (data.remainingFuelPercent != null) childDevice.sendEvent(name: "fuelPercent", value: data.remainingFuelPercent)
 
-    // Lock status is intentionally NOT derived from polls. Subaru's API reports door lock status as
-    // UNKNOWN except right after a remote command (confirmed on-vehicle, and the Home Assistant
-    // reference integration notes lock status "is always unknown"). The lock attribute reflects the
-    // last commanded state, set in finishCommand(), so refreshes no longer clobber it to "unknown".
+    // Lock status: derive from the per-door statuses, but emit ONLY when the reading is conclusive.
+    // Many vehicles report every door as UNKNOWN on polls (confirmed on-vehicle); emitting that
+    // clobbered the command-set value every refresh. When the poll is indeterminate we leave the
+    // attribute untouched, so the last commanded state (set in finishCommand) persists. Vehicles that
+    // do report real polled status will reflect it, including a lock/unlock done with the physical fob.
+    List lockStatuses = [data.doorFrontLeftLockStatus, data.doorFrontRightLockStatus,
+                         data.doorRearLeftLockStatus, data.doorRearRightLockStatus].findAll { it }
+    if (lockStatuses) {
+        String lockState = null
+        if (lockStatuses.every { it == "LOCKED" }) lockState = "locked"
+        else if (lockStatuses.any { it == "UNLOCKED" }) lockState = "unlocked"
+        if (lockState) childDevice.sendEvent(name: "lock", value: lockState)
+    }
 
     [windowFrontLeftStatus: "windowFrontLeft", windowFrontRightStatus: "windowFrontRight",
      windowRearLeftStatus: "windowRearLeft", windowRearRightStatus: "windowRearRight",
