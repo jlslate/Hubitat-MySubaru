@@ -286,8 +286,8 @@ private void createChildDevices() {
                 label: info.nickname ?: "Subaru ${info.modelName ?: vin}"
             ])
             // New device: seed lock as "unknown" so the Lock capability has a defined initial
-            // state. It becomes locked/unlocked only after a command - Subaru never reports lock
-            // status via polls (see updateConditionAttributes).
+            // state. Many vehicles report no usable lock status on polls, in which case it only
+            // becomes locked/unlocked after a command (see updateConditionAttributes).
             cd.sendEvent(name: "lock", value: "unknown")
         }
         cd.updateDataValue("vin", vin)
@@ -477,9 +477,14 @@ private void updateStatusAttributes(childDevice, String vin, Map data) {
         if (psi != null && data[apiKey].toString() != "32767") childDevice.sendEvent(name: attr, value: metric ? psiToKpa(psi) : psi, unit: metric ? "kPa" : "psi")
     }
 
-    // Location is emitted only from updateLocationAttributes (the locate payload). vehicleStatus and
-    // locate report the same coordinate at slightly different precision; emitting both flip-flopped
-    // the lat/long events on every refresh.
+    // Location: prefer the locate payload, which componentRefresh fetches for remote-service G2
+    // vehicles. Emitting from both vehicleStatus and locate flip-flopped lat/long on every refresh,
+    // since they report the same fix at differing precision. Vehicles that never reach the locate
+    // call (no remote subscription, or G1) still get their position from vehicleStatus here - both
+    // paths share the same rounding, so whichever one runs is churn-free.
+    if (!(hasRemoteService(vin) && effectiveApiGen(vin) == "g2")) {
+        updateLocationAttributes(childDevice, data)
+    }
 
     emitRecommendedTirePressure(childDevice, vin)
 }
@@ -563,9 +568,11 @@ private void updateLocationAttributes(childDevice, Map data) {
 }
 
 // Vehicle-health warning lamps. The endpoint returns every lamp the platform knows about; we keep
-// only the ones this vehicle actually advertises in its feature list (mirrors subarulink), roll the
-// active ones up into warningStatus/warningLampsActive/warningLamps, and surface a curated few as
-// their own attributes for direct RM/dashboard use. Each item: featureCode, isTrouble, onDates.
+// only the ones this vehicle advertises in its feature list, roll the active ones up into
+// warningStatus/warningLampsActive/warningLamps, and surface a curated few as their own attributes
+// for direct RM/dashboard use. Each item: featureCode, isTrouble, onDates.
+// Note: unlike the reference implementation, an empty feature list falls back to accepting all items
+// rather than filtering everything out, so a failed feature fetch degrades to over- not under-reporting.
 private void updateHealthAttributes(childDevice, String vin, List items) {
     List feats = state.vehicles[vin]?.features ?: []
     List applicable = items.findAll { it instanceof Map && it.featureCode && (feats.isEmpty() || feats.contains(it.featureCode)) }
