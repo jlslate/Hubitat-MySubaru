@@ -2,9 +2,9 @@
   "packageName": "MySubaru",
   "author": "jlslate",
   "minimumHEVersion": "2.3.4",
-  "version": "1.2.0",
-  "dateReleased": "2026-07-22",
-  "releaseNotes": "Polish pass from the same community code review: added a CODE_VERSION constant shown in the app UI, split logging into txtEnable/debugEnable/traceEnable (debug and trace auto-disable after 30 minutes), gave component* methods explicit void return types, stopped logging raw cookie values (now logs cookie names only, at trace level), and made the 16383/32767 sentinel-value checks type-safe against either string or numeric API responses.",
+  "version": "1.3.0",
+  "dateReleased": "2026-07-26",
+  "releaseNotes": "Adds vehicle-health warning lamps (a rolled-up warningStatus / warningLampsActive / warningLamps plus dedicated check-engine, washer-fluid, and TPMS attributes), manufacturer-recommended front/rear tire pressures, and an 'update from vehicle' command that wakes the car for a live reading. Reports metric units for Canadian accounts. Fixes lock state reverting to unknown on refresh, GPS event churn on every refresh, and a not-charging EV reporting the 65535 sentinel as a real time-to-full reading.",
   "documentationLink": "https://github.com/jlslate/Hubitat-MySubaru",
   "apps": [
     {

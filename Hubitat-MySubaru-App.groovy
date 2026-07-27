@@ -62,11 +62,19 @@ import groovy.json.JsonSlurper
 
 @Field static final String API_EV_CHARGE_NOW = "/service/g2/phevChargeNow/execute.json"
 
+// Vehicle-health / warning-lamp status. Plain GET at the API base (not under /service), no PIN.
+// Returns data.vehicleHealthItems[] where each item has featureCode / isTrouble / onDates.
+@Field static final String API_VEHICLE_HEALTH = "/vehicleHealth.json"
+
 @Field static final String DOOR_ALL = "ALL_DOORS_CMD"
+
+// Warning lamps worth their own attribute (highest home-automation value); every other lamp still
+// rolls up into warningLamps/warningLampsActive. Keyed by the API's featureCode.
+@Field static final Map HEALTH_CURATED = ["CEL_MIL": "checkEngine", "WASH_MIL": "washerFluid", "TPMS_MIL": "tirePressureWarning"]
 
 // Kept in sync with packageManifest.json's version - shown in the UI and logs to make it
 // easy to tell which release someone's running when troubleshooting.
-@Field static final String CODE_VERSION = "1.2.0"
+@Field static final String CODE_VERSION = "1.3.0"
 
 definition(
     name: "Subaru Connect",
@@ -74,6 +82,8 @@ definition(
     author: "jlslate (slate)",
     description: "Links your MySubaru STARLINK account to Hubitat: lock/unlock, horn/lights, remote start/stop, and vehicle status for each enrolled vehicle",
     category: "Convenience",
+    menu: "Integrations",
+    importUrl: "https://raw.githubusercontent.com/jlslate/Hubitat-MySubaru/main/Hubitat-MySubaru-App.groovy",
     iconUrl: "",
     iconX2Url: "",
     iconX3Url: ""
@@ -275,6 +285,10 @@ private void createChildDevices() {
                 name : "Subaru ${info.modelYear ?: ''} ${info.modelName ?: ''}".trim(),
                 label: info.nickname ?: "Subaru ${info.modelName ?: vin}"
             ])
+            // New device: seed lock as "unknown" so the Lock capability has a defined initial
+            // state. Many vehicles report no usable lock status on polls, in which case it only
+            // becomes locked/unlocked after a command (see updateConditionAttributes).
+            cd.sendEvent(name: "lock", value: "unknown")
         }
         cd.updateDataValue("vin", vin)
         cd.sendEvent(name: "modelName", value: info.modelName)
@@ -301,6 +315,11 @@ void componentRefresh(childDevice) {
 
         Map locateResp = subaruGet(API_LOCATE.replace("api_gen", gen))
         if (locateResp?.success && locateResp.data?.result) updateLocationAttributes(childDevice, locateResp.data.result as Map)
+
+        Map healthResp = subaruGet(API_VEHICLE_HEALTH)
+        if (healthResp?.success && healthResp.data instanceof Map && healthResp.data.vehicleHealthItems instanceof List) {
+            updateHealthAttributes(childDevice, vin, healthResp.data.vehicleHealthItems as List)
+        }
     }
 
     if (hasRemoteStart(vin) || isEv(vin)) fetchPresets(childDevice, vin)
@@ -348,6 +367,43 @@ void componentLocate(childDevice) {
     executeRemoteCommand(childDevice, vin, url, [:], poll, "LOCATE")
 }
 
+// Active "update from vehicle": wakes the car to report fresh telematics (~30s), then pulls the
+// refreshed cached data. Uses the same locate/execute flow as componentLocate; the "UPDATE" kind
+// tells finishCommand to run a follow-up refresh. Throttled and manual-only - it nibbles the 12V
+// battery, so it must never run on the poll schedule.
+@Field static final long ACTIVE_UPDATE_THROTTLE_MS = 300000L
+
+void componentUpdateFromVehicle(childDevice) {
+    String vin = childDevice.getDataValue("vin")
+    if (!hasRemoteService(vin)) {
+        logWarn "Update from vehicle needs an active remote subscription (${vin})"
+        childDevice.sendEvent(name: "lastCommandResult", value: "failed: no remote subscription")
+        return
+    }
+    Map lastMap = (state.lastActiveUpdate ?: [:]) as Map
+    long sinceMs = now() - ((lastMap[vin] ?: 0L) as long)
+    if (sinceMs < ACTIVE_UPDATE_THROTTLE_MS) {
+        int waitS = ((ACTIVE_UPDATE_THROTTLE_MS - sinceMs) / 1000L) as int
+        logTxt "Update from vehicle throttled - retry in ${waitS}s (protects the 12V battery)"
+        childDevice.sendEvent(name: "lastCommandResult", value: "throttled: retry in ${waitS}s")
+        return
+    }
+    lastMap[vin] = now()
+    state.lastActiveUpdate = lastMap
+    String gen = effectiveApiGen(vin)
+    String url = gen == "g1" ? API_G1_LOCATE_UPDATE : API_G2_LOCATE_UPDATE
+    String poll = gen == "g1" ? API_G1_LOCATE_STATUS : API_G2_LOCATE_STATUS
+    logTxt "Requesting active update from vehicle ${vin} - wakes the car, ~30s"
+    executeRemoteCommand(childDevice, vin, url, [:], poll, "UPDATE")
+}
+
+// Follow-up after an active update completes: the car has reported to Subaru's servers, so a normal
+// cached refresh now returns fresh odometer / tire pressures / vehicle state.
+def refreshAfterActiveUpdate(Map data) {
+    def cd = getChildDevice(data.dni as String)
+    if (cd) componentRefresh(cd)
+}
+
 void componentRemoteStop(childDevice) {
     String vin = childDevice.getDataValue("vin")
     if (!(hasRemoteStart(vin) || isEv(vin))) {
@@ -393,25 +449,70 @@ void componentChargeStart(childDevice) {
 /* ---------------- Attribute parsing ---------------- */
 
 private void updateStatusAttributes(childDevice, String vin, Map data) {
-    if (data.odometerValue != null) childDevice.sendEvent(name: "odometer", value: data.odometerValue)
-    // Subaru's sentinel "no data" values (16383/32767) are documented as strings, but it's
-    // unconfirmed against live traffic whether every field always returns them as strings rather
-    // than numbers - comparing via toString() catches the sentinel either way.
-    if (data.avgFuelConsumptionMpg && data.avgFuelConsumptionMpg.toString() != "16383") childDevice.sendEvent(name: "avgFuelConsumption", value: data.avgFuelConsumptionMpg)
-    if (data.distanceToEmptyFuelMiles10s && data.distanceToEmptyFuelMiles10s.toString() != "16383") childDevice.sendEvent(name: "distanceToEmpty", value: data.distanceToEmptyFuelMiles10s)
+    // Subaru's API returns both imperial and native-metric fields (e.g. odometerValue and
+    // odometerValueKilometers). For CAN, read the metric fields directly rather than converting -
+    // Subaru's own km value is authoritative (matches the dash). Tire pressures are reported in PSI,
+    // so those are converted for CAN. Sentinels (16383/32767) may be string or number.
+    boolean metric = (settings.country == "CAN")
+
+    BigDecimal odo = asNum(metric ? data.odometerValueKilometers : data.odometerValue)
+    if (odo != null) childDevice.sendEvent(name: "odometer", value: odo, unit: metric ? "km" : "mi")
+
+    def fcRaw = metric ? data.avgFuelConsumptionLitersPer100Kilometers : data.avgFuelConsumptionMpg
+    BigDecimal fc = asNum(fcRaw)
+    if (fc != null && fcRaw.toString() != "16383") childDevice.sendEvent(name: "avgFuelConsumption", value: fc, unit: metric ? "L/100km" : "mpg")
+
+    def dteRaw = metric ? data.distanceToEmptyFuelKilometers10s : data.distanceToEmptyFuelMiles10s
+    BigDecimal dte = asNum(dteRaw)
+    if (dte != null && dteRaw.toString() != "16383") childDevice.sendEvent(name: "distanceToEmpty", value: dte, unit: metric ? "km" : "mi")
+
     if (data.vehicleStateType) childDevice.sendEvent(name: "vehicleState", value: data.vehicleStateType)
+
+    // Tire pressures come in PSI; convert to kPa for CAN. Gated on the TPMS feature flag, matching the
+    // reference implementation's capability check, plus a value guard: 32767 is the "no reading"
+    // sentinel and the fields are null on vehicles that carry the feature but report no pressures.
     if (hasFeature(vin, "TPMS_MIL")) {
         [tirePressureFrontLeftPsi: "tirePressureFL", tirePressureFrontRightPsi: "tirePressureFR",
          tirePressureRearLeftPsi: "tirePressureRL", tirePressureRearRightPsi: "tirePressureRR"].each { apiKey, attr ->
-            if (data[apiKey] && data[apiKey].toString() != "32767") childDevice.sendEvent(name: attr, value: data[apiKey])
+            BigDecimal psi = asNum(data[apiKey])
+            if (psi != null && data[apiKey].toString() != "32767") childDevice.sendEvent(name: attr, value: metric ? psiToKpa(psi) : psi, unit: metric ? "kPa" : "psi")
         }
     }
-    if (data.latitude != null && data.longitude != null && data.latitude != 90 && data.longitude != 180) {
-        childDevice.sendEvent(name: "latitude", value: data.latitude)
-        childDevice.sendEvent(name: "longitude", value: data.longitude)
-        childDevice.sendEvent(name: "locationValid", value: "true")
+
+    // Location: prefer the locate payload, which componentRefresh fetches for remote-service G2
+    // vehicles. Emitting from both vehicleStatus and locate flip-flopped lat/long on every refresh,
+    // since they report the same fix at differing precision. Vehicles that never reach the locate
+    // call (no remote subscription, or G1) still get their position from vehicleStatus here - both
+    // paths share the same rounding, so whichever one runs is churn-free.
+    if (!(hasRemoteService(vin) && effectiveApiGen(vin) == "g2")) {
+        updateLocationAttributes(childDevice, data)
     }
+
+    emitRecommendedTirePressure(childDevice, vin)
 }
+
+// Manufacturer-recommended cold tire pressure, encoded in the vehicle's feature flags as
+// "TIF_<psi>" (front) / "TIR_<psi>" (rear) - no separate API call needed. PSI -> kPa for CAN.
+private void emitRecommendedTirePressure(childDevice, String vin) {
+    boolean metric = (settings.country == "CAN")
+    List feats = state.vehicles[vin]?.features ?: []
+    // Exactly one flag each, as the reference requires - multiple would be ambiguous, so emit nothing.
+    List front = feats.findAll { it?.startsWith("TIF_") }
+    List rear  = feats.findAll { it?.startsWith("TIR_") }
+    BigDecimal fp = front.size() == 1 ? asNum(front[0].tokenize("_").getAt(1)) : null
+    BigDecimal rp = rear.size()  == 1 ? asNum(rear[0].tokenize("_").getAt(1))  : null
+    if (fp != null) childDevice.sendEvent(name: "recommendedTirePressureFront", value: metric ? psiToKpa(fp) : fp, unit: metric ? "kPa" : "psi")
+    if (rp != null) childDevice.sendEvent(name: "recommendedTirePressureRear",  value: metric ? psiToKpa(rp) : rp, unit: metric ? "kPa" : "psi")
+}
+
+/* ---------------- Numeric helpers (Subaru reports PSI; gives native metric distance/fuel fields) ---------------- */
+
+private BigDecimal asNum(v) {
+    if (v == null) return null
+    try { return v as BigDecimal } catch (Exception ignored) { return null }
+}
+private BigDecimal psiToKpa(BigDecimal psi) { BigDecimal.valueOf(Math.round(psi.toDouble() * 6.894757d)) }
+private BigDecimal round5(BigDecimal v)     { v.setScale(5, BigDecimal.ROUND_HALF_UP) }
 
 private void updateConditionAttributes(childDevice, String vin, Map data) {
     [doorBootPosition: "doorBoot", doorEngineHoodPosition: "doorEngineHood",
@@ -422,13 +523,19 @@ private void updateConditionAttributes(childDevice, String vin, Map data) {
 
     if (data.remainingFuelPercent != null) childDevice.sendEvent(name: "fuelPercent", value: data.remainingFuelPercent)
 
-    List locks = [data.doorFrontLeftLockStatus, data.doorFrontRightLockStatus, data.doorRearLeftLockStatus, data.doorRearRightLockStatus].findAll { it }
-    if (locks) {
-        String lockState
-        if (locks.every { it == "LOCKED" }) lockState = "locked"
-        else if (locks.any { it == "UNLOCKED" }) lockState = "unlocked"
-        else lockState = "unknown"
-        childDevice.sendEvent(name: "lock", value: lockState)
+    // Lock status: derive from the per-door statuses, but emit ONLY when the reading is conclusive.
+    // Many vehicles report every door as UNKNOWN on polls (confirmed on-vehicle); emitting that
+    // clobbered the command-set value every refresh. When the poll is indeterminate we leave the
+    // attribute untouched, so the last commanded state (set in finishCommand) persists. Vehicles that
+    // do report real polled status will reflect it, including a lock/unlock done with the physical fob.
+    // Only LOCKED/UNLOCKED are real readings; UNKNOWN and NOT_EQUIPPED are placeholders (a door the
+    // car doesn't have still reports). Ignoring them keeps a NOT_EQUIPPED door from suppressing an
+    // otherwise conclusive result.
+    List lockStatuses = [data.doorFrontLeftLockStatus, data.doorFrontRightLockStatus,
+                         data.doorRearLeftLockStatus, data.doorRearRightLockStatus]
+                        .findAll { it in ["LOCKED", "UNLOCKED"] }
+    if (lockStatuses) {
+        childDevice.sendEvent(name: "lock", value: lockStatuses.contains("UNLOCKED") ? "unlocked" : "locked")
     }
 
     [windowFrontLeftStatus: "windowFrontLeft", windowFrontRightStatus: "windowFrontRight",
@@ -442,20 +549,52 @@ private void updateConditionAttributes(childDevice, String vin, Map data) {
         if (data.evIsPluggedIn) childDevice.sendEvent(name: "evPluggedIn", value: data.evIsPluggedIn)
         if (data.evChargerStateType) childDevice.sendEvent(name: "evChargerState", value: data.evChargerStateType)
         if (data.evDistanceToEmpty != null) childDevice.sendEvent(name: "evDistanceToEmpty", value: data.evDistanceToEmpty)
-        if (data.evTimeToFullyCharged != null) childDevice.sendEvent(name: "evTimeToFullyCharged", value: data.evTimeToFullyCharged)
+        // 65535 is Subaru's "no valid reading" sentinel for time-to-full (e.g. not charging) - skip it,
+        // same handling as the 16383/32767 sentinels above.
+        if (data.evTimeToFullyCharged != null && data.evTimeToFullyCharged.toString() != "65535") childDevice.sendEvent(name: "evTimeToFullyCharged", value: data.evTimeToFullyCharged)
     }
 
     if (data.lastUpdatedTime) childDevice.sendEvent(name: "lastUpdated", value: data.lastUpdatedTime)
 }
 
 private void updateLocationAttributes(childDevice, Map data) {
-    if (data.latitude != null && data.longitude != null && data.latitude != 90 && data.longitude != 180) {
-        childDevice.sendEvent(name: "latitude", value: data.latitude)
-        childDevice.sendEvent(name: "longitude", value: data.longitude)
+    BigDecimal lat = asNum(data.latitude)
+    BigDecimal lon = asNum(data.longitude)
+    if (lat != null && lon != null && lat != 90 && lon != 180) {
+        // Round to ~1 m (5 dp). Subaru's cached fix jitters in the last decimals between reports,
+        // which would otherwise fire a new lat/long event on every refresh even while parked.
+        childDevice.sendEvent(name: "latitude", value: round5(lat))
+        childDevice.sendEvent(name: "longitude", value: round5(lon))
         childDevice.sendEvent(name: "locationValid", value: "true")
     } else {
         childDevice.sendEvent(name: "locationValid", value: "false")
     }
+}
+
+// Vehicle-health warning lamps. The endpoint returns every lamp the platform knows about; we keep
+// only the ones this vehicle advertises in its feature list, roll the active ones up into
+// warningStatus/warningLampsActive/warningLamps, and surface a curated few as their own attributes
+// for direct RM/dashboard use. Each item: featureCode, isTrouble, onDates.
+// Note: unlike the reference implementation, an empty feature list falls back to accepting all items
+// rather than filtering everything out, so a failed feature fetch degrades to over- not under-reporting.
+private void updateHealthAttributes(childDevice, String vin, List items) {
+    List feats = state.vehicles[vin]?.features ?: []
+    List applicable = items.findAll { it instanceof Map && it.featureCode && (feats.isEmpty() || feats.contains(it.featureCode)) }
+    List active = applicable.findAll { isTroubleFlag(it.isTrouble) }
+
+    childDevice.sendEvent(name: "warningStatus", value: active ? "warning" : "clear")
+    childDevice.sendEvent(name: "warningLampsActive", value: active.size())
+    childDevice.sendEvent(name: "warningLamps", value: active.collect { it.b2cCode ?: it.featureCode }.join(", "))
+
+    HEALTH_CURATED.each { code, attr ->
+        def item = applicable.find { it.featureCode == code }
+        if (item != null) childDevice.sendEvent(name: attr, value: isTroubleFlag(item.isTrouble) ? "warning" : "clear")
+    }
+}
+
+// Defensive: the API returns a JSON boolean, but tolerate a stringified "true" just in case.
+private boolean isTroubleFlag(v) {
+    v == true || v?.toString()?.equalsIgnoreCase("true")
 }
 
 private void fetchPresets(childDevice, String vin) {
@@ -713,6 +852,12 @@ private void finishCommand(Map ctx, Map result) {
             break
         case "LOCATE":
             if (result?.success && result?.result) updateLocationAttributes(childDevice, result.result as Map)
+            break
+        case "UPDATE":
+            if (result?.success && result?.result) updateLocationAttributes(childDevice, result.result as Map)
+            // Car has now reported fresh telematics; pull the refreshed cached data after a short
+            // settle delay (odometer / tire pressures / vehicle state).
+            if (result?.success) runInMillis(3000, "refreshAfterActiveUpdate", [data: [dni: ctx.dni], overwrite: false])
             break
     }
 }

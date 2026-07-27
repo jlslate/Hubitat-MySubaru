@@ -16,7 +16,8 @@
  */
 
 metadata {
-    definition(name: "Subaru Vehicle", namespace: "jlslate", author: "jlslate (slate)") {
+    definition(name: "Subaru Vehicle", namespace: "jlslate", author: "jlslate (slate)",
+               importUrl: "https://raw.githubusercontent.com/jlslate/Hubitat-MySubaru/main/Hubitat-MySubaru-Driver.groovy") {
         capability "Lock"
         capability "Refresh"
         capability "Actuator"
@@ -29,6 +30,7 @@ metadata {
         command "flashLights"
         command "stopFlashLights"
         command "locate"
+        command "updateFromVehicle"
         command "remoteStart", [[name: "presetName*", type: "STRING", description: "Climate preset name, as saved in the MySubaru app (see the 'presets' attribute for available names)"]]
         command "remoteStop"
         command "chargeStart"
@@ -55,6 +57,8 @@ metadata {
         attribute "tirePressureFR", "number"
         attribute "tirePressureRL", "number"
         attribute "tirePressureRR", "number"
+        attribute "recommendedTirePressureFront", "number"
+        attribute "recommendedTirePressureRear", "number"
         attribute "latitude", "number"
         attribute "longitude", "number"
         attribute "locationValid", "string"
@@ -66,6 +70,12 @@ metadata {
         attribute "presets", "string"
         attribute "lastUpdated", "string"
         attribute "lastCommandResult", "string"
+        attribute "warningStatus", "string"
+        attribute "warningLampsActive", "number"
+        attribute "warningLamps", "string"
+        attribute "checkEngine", "string"
+        attribute "washerFluid", "string"
+        attribute "tirePressureWarning", "string"
     }
 }
 
@@ -113,6 +123,10 @@ def stopFlashLights() {
 
 def locate() {
     parent?.componentLocate(device)
+}
+
+def updateFromVehicle() {
+    parent?.componentUpdateFromVehicle(device)
 }
 
 def remoteStart(String presetName) {
